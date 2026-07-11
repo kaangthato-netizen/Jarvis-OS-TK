@@ -175,6 +175,8 @@ const LAYOUTS = [
 const DEFAULT_SETTINGS = {
   name: "Thato", city: "Gaborone", country: "BW", lat: -24.6541, lon: 25.9087,
   theme: "daylight", layout: "grid", voiceRate: 1.0, voicePitch: 0.92, wakeWord: true,
+  ttsEngine: "browser",    // "browser" (free, robotic) | "gemini" (natural — needs a Gemini key)
+  ttsVoice: "Charon", ttsStyle: "a calm, warm British butler — natural, unhurried, subtly witty", geminiKey: "",
   aiProvider: "claude", aiKey: "", aiModel: "claude-fable-5",
   proxyUrl: "",            // optional backend proxy (see proxy-server.js) — keeps API keys off the browser
   autoLockMin: 0,          // security: minutes of idle before auto-lock; 0 = off (PIN itself lives in its own storage key)
@@ -692,6 +694,42 @@ async function sha256(str) {
 }
 
 /* ============================================================
+   NATURAL VOICE — Gemini TTS. Returns 24 kHz PCM which we play
+   through WebAudio. Falls back to the browser voice on any error.
+   Uses Settings → Voice → Gemini key (or the AI-Brain key when
+   the provider is Gemini).
+   ============================================================ */
+const GEMINI_VOICES = ["Charon", "Puck", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr"];
+let jarvisAudioCtx = null, jarvisAudioSrc = null;
+function geminiTtsKey(settings) { return settings.geminiKey || (settings.aiProvider === "gemini" ? settings.aiKey : ""); }
+async function geminiSpeak(text, settings, hooks) {
+  const key = geminiTtsKey(settings);
+  if (!key) throw new Error("no Gemini key");
+  const styled = settings.ttsStyle ? `Say this as ${settings.ttsStyle}: ${text}` : text;
+  const r = await fetch(`${apiBase(settings, "https://generativelanguage.googleapis.com")}/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${key}`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: [{ text: styled }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: settings.ttsVoice || "Charon" } } } } }),
+  });
+  if (!r.ok) throw new Error("Gemini TTS " + r.status);
+  const j = await r.json();
+  const b64 = j.candidates[0].content.parts[0].inlineData.data;
+  const bin = atob(b64); const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const pcm = new Int16Array(bytes.buffer);
+  jarvisAudioCtx = jarvisAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  if (jarvisAudioCtx.state === "suspended") await jarvisAudioCtx.resume();
+  const buf = jarvisAudioCtx.createBuffer(1, pcm.length, 24000);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  if (jarvisAudioSrc) { try { jarvisAudioSrc.stop(); } catch {} }
+  const src = jarvisAudioCtx.createBufferSource();
+  jarvisAudioSrc = src;
+  src.buffer = buf; src.connect(jarvisAudioCtx.destination);
+  if (hooks && hooks.onstart) hooks.onstart();
+  return new Promise((res) => { src.onended = () => { if (hooks && hooks.onend) hooks.onend(); res(); }; src.start(); });
+}
+
+/* ============================================================
    SCHEDULED TRIGGERS
    ============================================================ */
 const TRIGGERS = [
@@ -750,11 +788,32 @@ function Clock({ weather, city, country }) {
   );
 }
 
-function Badge({ children, className }) {
-  return <span className={cx("text-[10px] px-2 py-0.5 rounded-full border", className)}>{children}</span>;
+function Badge({ children, className, onClick, title }) {
+  return <span onClick={onClick} title={title} className={cx("text-[10px] px-2 py-0.5 rounded-full border", onClick && "cursor-pointer select-none", className)}>{children}</span>;
 }
 
-function Widget({ id, title, agent, size, onDragStart, onDragOver, onDrop, onResize, dragging, dropTarget, children }) {
+/* generic inline add-form: fields = [{k, ph, w?, type?, opts?}] */
+function AddRow({ fields, onAdd, label = "+" }) {
+  const [v, setV] = useState({});
+  return (
+    <form className="flex gap-1.5 flex-wrap" onSubmit={(e) => { e.preventDefault(); if (!fields.some((f) => (v[f.k] || "").trim && (v[f.k] || "").trim())) return; onAdd(v); setV({}); }}>
+      {fields.map((f) => f.opts ? (
+        <select key={f.k} value={v[f.k] || f.opts[0]} onChange={(e) => setV({ ...v, [f.k]: e.target.value })} className="sub border border-ink/10 rounded-lg px-1.5 py-1.5 text-xs outline-none">
+          {f.opts.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select>
+      ) : (
+        <input key={f.k} value={v[f.k] || ""} onChange={(e) => setV({ ...v, [f.k]: e.target.value })} placeholder={f.ph} type={f.type || "text"}
+          className={cx("sub border border-ink/10 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-acc/50", f.w || "flex-1 min-w-[70px]")} />
+      ))}
+      <button className="text-xs px-2.5 py-1.5 rounded-lg bg-acc/15 border border-acc/40 text-acc">{label}</button>
+    </form>
+  );
+}
+function Del({ onClick }) {
+  return <button onClick={onClick} title="Delete" className="text-dim hover:text-bad text-xs shrink-0">✕</button>;
+}
+
+function Widget({ id, title, agent, size, onDragStart, onDragOver, onDrop, onResize, onAsk, dragging, dropTarget, children }) {
   const span = size === "lg" ? "md:col-span-2 xl:col-span-3" : size === "md" ? "md:col-span-2 xl:col-span-2" : "md:col-span-1";
   return (
     <MDiv layout initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96 }} transition={{ duration: 0.25 }}
@@ -767,6 +826,7 @@ function Widget({ id, title, agent, size, onDragStart, onDragOver, onDrop, onRes
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {agent && <Badge className="border-acc/25 text-acc/80 hidden sm:inline">{agent}</Badge>}
+          {onAsk && <button onClick={() => onAsk(id)} title={`Ask the ${agent || "PA"} agent to analyse this`} className="text-dim hover:text-acc text-xs">✨</button>}
           <button onClick={() => onResize(id)} title="Resize" className="text-dim hover:text-acc text-xs">⤢</button>
         </div>
       </div>
@@ -875,9 +935,12 @@ function Notes({ notes, add, remove }) {
   );
 }
 
-function PatientQueue({ queue, markSeen }) {
+const RISK_CYCLE = { low: "medium", medium: "high", high: "low" };
+function PatientQueue({ queue, markSeen, mut }) {
   return (
     <div className="space-y-2">
+      <AddRow fields={[{ k: "time", ph: "08:30", w: "w-16" }, { k: "name", ph: "Patient name" }, { k: "reason", ph: "Reason" }, { k: "risk", opts: ["low", "medium", "high"] }]}
+        onAdd={(v) => mut("queue", (q) => [...q, { id: uid(), name: v.name || "Unnamed", time: v.time || "—", reason: v.reason || "", risk: v.risk || "low", note: "", seen: false }])} />
       {queue.map((p) => (
         <div key={p.id} className={cx("flex items-center gap-3 rounded-lg px-3 py-2 sub", p.seen && "opacity-40")}>
           <span className="font-mono text-acc/80 text-xs w-10">{p.time}</span>
@@ -885,19 +948,23 @@ function PatientQueue({ queue, markSeen }) {
             <div className="text-sm truncate">{p.name}</div>
             <div className="text-[11px] text-mut truncate">{p.reason}{p.note ? ` — ${p.note}` : ""}</div>
           </div>
-          <Badge className={RISK_STYLE[p.risk]}>{p.risk}</Badge>
+          <Badge onClick={() => mut("queue", (q) => q.map((x) => x.id === p.id ? { ...x, risk: RISK_CYCLE[x.risk] } : x))} title="Click to change risk" className={RISK_STYLE[p.risk]}>{p.risk}</Badge>
           <button onClick={() => markSeen(p.id)} className="text-[11px] text-mut hover:text-acc">{p.seen ? "↩" : "✓ seen"}</button>
+          <Del onClick={() => mut("queue", (q) => q.filter((x) => x.id !== p.id))} />
         </div>
       ))}
     </div>
   );
 }
 
-function TodaySchedule() {
+function TodaySchedule({ schedule, mut }) {
   return (
     <div className="space-y-2">
-      {STUB_CLINIC_SCHEDULE.map((s) => (
-        <div key={s.time} className="flex gap-3 text-sm"><span className="font-mono text-acc/80 text-xs w-24 shrink-0">{s.time}</span><span className="text-ink/90">{s.item}</span></div>
+      <AddRow fields={[{ k: "time", ph: "14:00", w: "w-20" }, { k: "item", ph: "What's happening" }]}
+        onAdd={(v) => mut("schedule", (s) => [...s, { time: v.time || "—", item: v.item || "" }])} />
+      {schedule.map((s, i) => (
+        <div key={i} className="flex gap-3 text-sm items-center"><span className="font-mono text-acc/80 text-xs w-24 shrink-0">{s.time}</span><span className="text-ink/90 flex-1">{s.item}</span>
+          <Del onClick={() => mut("schedule", (arr) => arr.filter((_, j) => j !== i))} /></div>
       ))}
       <div className="text-[11px] text-bad/90 pt-1">⚠ Forecast: {CLINIC_HOURS_TODAY}h day → PA has blocked tomorrow evening for family.</div>
     </div>
@@ -914,14 +981,18 @@ function RiskFlags({ queue }) {
   );
 }
 
-function FamilyCalendar({ events }) {
+function FamilyCalendar({ events, mut }) {
   return (
     <div className="space-y-2">
+      <AddRow fields={[{ k: "date", ph: "", type: "date", w: "w-32" }, { k: "time", ph: "", type: "time", w: "w-24" }, { k: "who", ph: "Who", w: "w-20" }, { k: "what", ph: "What" }]}
+        onAdd={(v) => { const date = v.date || new Date().toISOString().slice(0, 10); const day = new Date(date + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short" });
+          mut("familyEvents", (ev) => [...ev, { id: uid(), day, date, time: v.time || "09:00", who: v.who || "Family", what: v.what || "", cal: "Household" }]); }} />
       {events.map((e) => (
         <div key={e.id} className="flex items-center gap-3 rounded-lg px-3 py-2 sub">
           <span className="font-mono text-warn/90 text-xs w-16 shrink-0">{e.day} {e.time}</span>
           <div className="flex-1 min-w-0"><div className="text-sm truncate">{e.what}</div><div className="text-[11px] text-mut">{e.who} · {e.cal}</div></div>
           <button onClick={() => downloadICS(`${e.who}: ${e.what}`, e.date, e.time)} title="Export to Calendar (.ics)" className="text-mut hover:text-acc text-sm">📤</button>
+          <Del onClick={() => mut("familyEvents", (ev) => ev.filter((x) => x.id !== e.id))} />
         </div>
       ))}
       <div className="text-[10px] text-dim">📤 exports .ics → opens in Apple/Google Calendar · import .ics via Files connector</div>
@@ -957,15 +1028,18 @@ function DateNightPlanner({ speak }) {
   );
 }
 
-function ResearchInbox({ papers, toggleRead }) {
+function ResearchInbox({ papers, toggleRead, mut }) {
   return (
     <div className="space-y-2">
+      <AddRow fields={[{ k: "title", ph: "Paper title" }, { k: "journal", ph: "Journal", w: "w-28" }]}
+        onAdd={(v) => mut("papers", (ps) => [{ id: uid(), title: v.title || "Untitled", journal: v.journal || "—", added: "today", read: false }, ...ps])} />
       {papers.map((p) => (
         <div key={p.id} className={cx("rounded-lg sub px-3 py-2", p.read && "opacity-45")}>
           <div className="text-sm leading-snug">{p.title}</div>
-          <div className="flex items-center justify-between mt-1">
-            <span className="text-[11px] text-mut">{p.journal} · {p.added}</span>
+          <div className="flex items-center justify-between mt-1 gap-2">
+            <span className="text-[11px] text-mut flex-1">{p.journal} · {p.added}</span>
             <button onClick={() => toggleRead(p.id)} className="text-[11px] text-acc/80 hover:text-acc">{p.read ? "mark unread" : "✓ mark read"}</button>
+            <Del onClick={() => mut("papers", (ps) => ps.filter((x) => x.id !== p.id))} />
           </div>
         </div>
       ))}
@@ -973,51 +1047,72 @@ function ResearchInbox({ papers, toggleRead }) {
   );
 }
 
-function BookProgress({ book, openBook }) {
-  const pct = Math.round((book.currentWords / book.targetWords) * 100);
+const CH_CYCLE = { outline: "in progress", "in progress": "done", done: "outline" };
+function BookProgress({ book, openBook, mut }) {
+  const pct = Math.min(100, Math.round((book.currentWords / book.targetWords) * 100));
   const current = book.chapters.find((c) => c.status === "in progress");
+  const setBook = (patch) => mut("book", (b) => ({ ...b, ...patch }));
   return (
     <div className="space-y-3">
       <div className="text-sm font-semibold text-good">“{book.title}”</div>
       <div>
-        <div className="flex justify-between text-[11px] text-mut mb-1"><span>{book.currentWords.toLocaleString()} words</span><span>{pct}% of {book.targetWords.toLocaleString()}</span></div>
+        <div className="flex justify-between items-center text-[11px] text-mut mb-1">
+          <span><input type="number" value={book.currentWords} onChange={(e) => setBook({ currentWords: parseInt(e.target.value) || 0 })}
+            className="w-20 sub border border-ink/10 rounded px-1 py-0.5 text-[11px] outline-none focus:border-acc/50" /> words</span>
+          <span>{pct}% of <input type="number" value={book.targetWords} onChange={(e) => setBook({ targetWords: parseInt(e.target.value) || 1 })}
+            className="w-20 sub border border-ink/10 rounded px-1 py-0.5 text-[11px] outline-none focus:border-acc/50" /></span>
+        </div>
         <div className="h-2 rounded-full bg-ink/10 overflow-hidden"><div className="h-full rounded-full bg-gradient-to-r from-acc to-good" style={{ width: pct + "%" }} /></div>
       </div>
-      {current && <div className="text-xs rounded-lg sub px-3 py-2">✍️ <b>Ch. {current.n} — {current.title}:</b> {current.nextTask}</div>}
+      {current && <div className="text-xs rounded-lg sub px-3 py-2">✍️ <b>Ch. {current.n} — {current.title}:</b>{" "}
+        <input value={current.nextTask || ""} onChange={(e) => mut("book", (b) => ({ ...b, chapters: b.chapters.map((c) => c.n === current.n ? { ...c, nextTask: e.target.value } : c) }))}
+          className="w-full mt-1 sub border border-ink/10 rounded px-2 py-1 text-xs outline-none focus:border-acc/50" /></div>}
       <div className="flex gap-2 flex-wrap">
         <button onClick={openBook} className="text-xs px-3 py-1.5 rounded-lg border border-acc/40 text-acc bg-acc/10 hover:bg-acc/20">📖 Open book (canvas + track changes)</button>
         <a href={CONFIG.BOOK_GOOGLE_DOC_URL} target="_blank" className="text-xs px-3 py-1.5 rounded-lg border border-ink/10 text-mut hover:bg-ink/5">📝 Open in Google Docs ↗</a>
       </div>
       <div className="grid grid-cols-3 gap-1 text-[10px]">
         {book.chapters.map((ch) => (
-          <div key={ch.n} className={cx("rounded px-1.5 py-1 text-center border", ch.status === "done" ? "border-good/40 text-good" : ch.status === "in progress" ? "border-warn/50 text-warn" : "border-ink/10 text-dim")}>Ch{ch.n}</div>
+          <button key={ch.n} title={`${ch.title} — ${ch.status} (click to change)`}
+            onClick={() => mut("book", (b) => ({ ...b, chapters: b.chapters.map((c) => c.n === ch.n ? { ...c, status: CH_CYCLE[c.status] || "outline" } : c) }))}
+            className={cx("rounded px-1.5 py-1 text-center border", ch.status === "done" ? "border-good/40 text-good" : ch.status === "in progress" ? "border-warn/50 text-warn" : "border-ink/10 text-dim")}>Ch{ch.n}</button>
         ))}
       </div>
     </div>
   );
 }
 
-function CitationTracker() {
+const CITE_CYCLE = { verified: "needs page #", "needs page #": "to add", "to add": "verified" };
+function CitationTracker({ citations, mut }) {
   return (
     <div className="space-y-1.5 text-xs">
-      {STUB_CITATIONS.map((c) => (
-        <div key={c.id} className="flex items-center justify-between rounded-lg sub px-3 py-2">
-          <span><b className="text-ink">{c.key}</b> <span className="text-dim">· {c.used}</span></span>
-          <Badge className={c.status === "verified" ? "border-good/40 text-good" : "border-warn/40 text-warn"}>{c.status}</Badge>
+      <AddRow fields={[{ k: "key", ph: "Author Year" }, { k: "used", ph: "Ch. #", w: "w-16" }]}
+        onAdd={(v) => mut("citations", (cs) => [...cs, { id: uid(), key: v.key || "?", used: v.used || "—", status: "to add" }])} />
+      {citations.map((c) => (
+        <div key={c.id} className="flex items-center justify-between gap-2 rounded-lg sub px-3 py-2">
+          <span className="flex-1"><b className="text-ink">{c.key}</b> <span className="text-dim">· {c.used}</span></span>
+          <Badge onClick={() => mut("citations", (cs) => cs.map((x) => x.id === c.id ? { ...x, status: CITE_CYCLE[x.status] } : x))} title="Click to change status"
+            className={c.status === "verified" ? "border-good/40 text-good" : "border-warn/40 text-warn"}>{c.status}</Badge>
+          <Del onClick={() => mut("citations", (cs) => cs.filter((x) => x.id !== c.id))} />
         </div>
       ))}
     </div>
   );
 }
 
-function HustlePipeline({ pipeline }) {
+const STAGE_CYCLE = { Idea: "Validating", Validating: "Building", Building: "Earning", Earning: "Idea" };
+function HustlePipeline({ pipeline, mut }) {
   const STAGES = ["Idea", "Validating", "Building", "Earning"];
   const stageColor = { Idea: "text-dim border-ink/10", Validating: "text-info border-info/30", Building: "text-warn border-warn/30", Earning: "text-good border-good/30" };
   return (
     <div className="space-y-2">
+      <AddRow fields={[{ k: "idea", ph: "New idea" }, { k: "next", ph: "Next action" }]}
+        onAdd={(v) => mut("pipeline", (ps) => [...ps, { id: uid(), idea: v.idea || "Untitled", stage: "Idea", next: v.next || "Define the first step" }])} />
       {STAGES.map((st) => pipeline.filter((p) => p.stage === st).map((p) => (
         <div key={p.id} className="rounded-lg sub px-3 py-2">
-          <div className="flex items-center justify-between gap-2"><span className="text-sm">{p.idea}</span><Badge className={stageColor[st]}>{st}</Badge></div>
+          <div className="flex items-center justify-between gap-2"><span className="text-sm flex-1">{p.idea}</span>
+            <Badge onClick={() => mut("pipeline", (ps) => ps.map((x) => x.id === p.id ? { ...x, stage: STAGE_CYCLE[x.stage] } : x))} title="Click to advance stage" className={stageColor[st]}>{st}</Badge>
+            <Del onClick={() => mut("pipeline", (ps) => ps.filter((x) => x.id !== p.id))} /></div>
           <div className="text-[11px] text-mut mt-0.5">→ {p.next}</div>
         </div>
       )))}
@@ -1025,16 +1120,21 @@ function HustlePipeline({ pipeline }) {
   );
 }
 
-function RevenueTracker({ revenue }) {
-  const mo = revenue.reduce((s, r) => s + r.month, 0), ytd = revenue.reduce((s, r) => s + r.ytd, 0);
+function RevenueTracker({ revenue, mut }) {
+  const mo = revenue.reduce((s, r) => s + (parseFloat(r.month) || 0), 0), ytd = revenue.reduce((s, r) => s + (parseFloat(r.ytd) || 0), 0);
   return (
     <div className="space-y-2 text-sm">
       <div className="flex gap-3">
         <div className="flex-1 rounded-xl bg-good/10 border border-good/25 p-3 text-center"><div className="text-xl font-bold text-good">${mo}</div><div className="text-[10px] text-mut">this month</div></div>
         <div className="flex-1 rounded-xl sub border border-ink/10 p-3 text-center"><div className="text-xl font-bold text-ink">${ytd}</div><div className="text-[10px] text-mut">year to date</div></div>
       </div>
-      {revenue.map((r) => (
-        <div key={r.source} className="flex justify-between text-xs px-1"><span className="text-ink/90">{r.source}</span><span className="font-mono text-good">${r.month}</span></div>
+      <AddRow fields={[{ k: "source", ph: "New income source" }, { k: "month", ph: "$/mo", type: "number", w: "w-16" }]}
+        onAdd={(v) => mut("revenue", (rs) => [...rs, { source: v.source || "New source", month: parseFloat(v.month) || 0, ytd: parseFloat(v.month) || 0 }])} />
+      {revenue.map((r, i) => (
+        <div key={i} className="flex items-center justify-between gap-2 text-xs px-1"><span className="text-ink/90 flex-1">{r.source}</span>
+          <span className="font-mono text-good">$<input type="number" value={r.month} onChange={(e) => mut("revenue", (rs) => rs.map((x, j) => j === i ? { ...x, month: parseFloat(e.target.value) || 0 } : x))}
+            className="w-16 sub border border-ink/10 rounded px-1 py-0.5 outline-none focus:border-acc/50" /></span>
+          <Del onClick={() => mut("revenue", (rs) => rs.filter((_, j) => j !== i))} /></div>
       ))}
     </div>
   );
@@ -1059,9 +1159,11 @@ function SkillLab({ speak }) {
   );
 }
 
-function UnifiedInbox({ inbox, onDraft }) {
+function UnifiedInbox({ inbox, onDraft, mut }) {
   return (
     <div className="space-y-2">
+      <AddRow fields={[{ k: "from", ph: "From", w: "w-24" }, { k: "subject", ph: "Subject" }, { k: "priority", opts: ["high", "medium", "low"] }]}
+        onAdd={(v) => mut("inbox", (ms) => [{ id: uid(), from: v.from || "?", src: "Gmail", subject: v.subject || "", priority: v.priority || "medium", time: new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) }, ...ms])} />
       {inbox.map((m) => (
         <div key={m.id} className="flex items-center gap-3 rounded-lg sub px-3 py-2">
           <span className="text-base">{m.src === "WhatsApp" ? "💬" : "✉️"}</span>
@@ -1070,6 +1172,7 @@ function UnifiedInbox({ inbox, onDraft }) {
             <div className="text-[10px] text-dim">{m.src} · {m.time} · {m.priority} priority</div>
           </div>
           {m.src === "Gmail" && <button onClick={() => onDraft(m.from)} className="text-[11px] text-acc/80 hover:text-acc shrink-0">✍ draft</button>}
+          <Del onClick={() => mut("inbox", (ms) => ms.filter((x) => x.id !== m.id))} />
         </div>
       ))}
     </div>
@@ -1087,14 +1190,16 @@ function PALog({ log }) {
   );
 }
 
-function LifeAdmin({ items, toggle }) {
+function LifeAdmin({ items, toggle, onAdd, onDel }) {
   return (
     <div className="space-y-1.5 text-sm">
+      {onAdd && <AddRow fields={[{ k: "item", ph: "New task" }, { k: "due", ph: "Due", w: "w-20" }]} onAdd={(v) => onAdd(v.item || "Untitled", v.due || "—")} />}
       {items.map((a) => (
         <label key={a.id} className="flex items-center gap-2 cursor-pointer rounded-lg sub px-3 py-2">
           <input type="checkbox" checked={a.done} onChange={() => toggle(a.id)} />
           <span className={cx("flex-1", a.done && "line-through text-dim")}>{a.item}</span>
           <span className="text-[10px] text-dim">{a.due}</span>
+          {onDel && <Del onClick={() => onDel(a.id)} />}
         </label>
       ))}
     </div>
@@ -1481,7 +1586,7 @@ function ConnectorModal({ conn, onClose, importFiles, exportData, exportDaySumma
   );
 }
 
-function SettingsModal({ settings, update, pinHash, setPinHash, onClose, notifyStatus, requestNotify, exportData, importRef, resetAll, testAI, aiTestState }) {
+function SettingsModal({ settings, update, pinHash, setPinHash, onClose, notifyStatus, requestNotify, exportData, importRef, resetAll, resetDemo, testAI, aiTestState, testVoice }) {
   const S = (patch) => update((s) => ({ ...s, ...patch }));
   const row = "flex items-center justify-between gap-3 text-sm";
   const inp = "sub border border-ink/10 rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-acc/50";
@@ -1517,8 +1622,30 @@ function SettingsModal({ settings, update, pinHash, setPinHash, onClose, notifyS
           </div>
 
           <h3 className="text-xs uppercase tracking-widest text-acc font-semibold pt-2">Voice</h3>
-          <div className={row}><span className="text-mut">Speaking rate: {settings.voiceRate.toFixed(2)}</span><input type="range" min="0.7" max="1.4" step="0.05" value={settings.voiceRate} onChange={(e) => S({ voiceRate: parseFloat(e.target.value) })} /></div>
-          <div className={row}><span className="text-mut">Pitch: {settings.voicePitch.toFixed(2)}</span><input type="range" min="0.6" max="1.3" step="0.02" value={settings.voicePitch} onChange={(e) => S({ voicePitch: parseFloat(e.target.value) })} /></div>
+          <div className={row}><span className="text-mut">Engine</span>
+            <select className={inp} value={settings.ttsEngine} onChange={(e) => S({ ttsEngine: e.target.value })}>
+              <option value="browser">Browser (free, robotic)</option>
+              <option value="gemini">Gemini TTS (natural ✨)</option>
+            </select></div>
+          {settings.ttsEngine === "gemini" ? (
+            <React.Fragment>
+              <div className={row}><span className="text-mut">Gemini voice</span>
+                <select className={inp} value={settings.ttsVoice} onChange={(e) => S({ ttsVoice: e.target.value })}>
+                  {GEMINI_VOICES.map((v) => <option key={v} value={v}>{v}</option>)}
+                </select></div>
+              <div className={row}><span className="text-mut">Speaking style</span>
+                <input className={inp + " flex-1"} value={settings.ttsStyle} onChange={(e) => S({ ttsStyle: e.target.value })} placeholder="a calm, warm British butler…" /></div>
+              <div className={row}><span className="text-mut">Gemini API key</span>
+                <input type="password" placeholder={settings.aiProvider === "gemini" && settings.aiKey ? "using AI-Brain key ✓" : "AIza…"} className={inp + " flex-1"} value={settings.geminiKey} onChange={(e) => S({ geminiKey: e.target.value })} /></div>
+              <p className="text-[10px] text-dim leading-relaxed">Get a free key at aistudio.google.com. If your AI Brain already uses Gemini, that key is reused automatically. Each spoken reply is one small TTS call; if it ever fails, Jarvis falls back to the browser voice so he's never silent.</p>
+            </React.Fragment>
+          ) : (
+            <React.Fragment>
+              <div className={row}><span className="text-mut">Speaking rate: {settings.voiceRate.toFixed(2)}</span><input type="range" min="0.7" max="1.4" step="0.05" value={settings.voiceRate} onChange={(e) => S({ voiceRate: parseFloat(e.target.value) })} /></div>
+              <div className={row}><span className="text-mut">Pitch: {settings.voicePitch.toFixed(2)}</span><input type="range" min="0.6" max="1.3" step="0.02" value={settings.voicePitch} onChange={(e) => S({ voicePitch: parseFloat(e.target.value) })} /></div>
+            </React.Fragment>
+          )}
+          <button onClick={testVoice} className="text-xs px-3 py-1.5 rounded-lg border border-acc/40 text-acc bg-acc/10">🔊 Test voice</button>
           <label className={row + " cursor-pointer"}><span className="text-mut">Require wake word "Jarvis"</span><input type="checkbox" checked={settings.wakeWord} onChange={(e) => S({ wakeWord: e.target.checked })} /></label>
 
           <h3 className="text-xs uppercase tracking-widest text-acc font-semibold pt-2">Notifications</h3>
@@ -1561,6 +1688,7 @@ function SettingsModal({ settings, update, pinHash, setPinHash, onClose, notifyS
           <div className="flex gap-2 flex-wrap">
             <button onClick={exportData} className="text-xs px-3 py-1.5 rounded-lg border border-ink/10 text-ink/90">📤 Export backup</button>
             <button onClick={() => importRef.current.click()} className="text-xs px-3 py-1.5 rounded-lg border border-ink/10 text-ink/90">📥 Import backup / files</button>
+            <button onClick={resetDemo} className="text-xs px-3 py-1.5 rounded-lg border border-warn/40 text-warn">↺ Reset demo data</button>
             <button onClick={resetAll} className="text-xs px-3 py-1.5 rounded-lg border border-bad/40 text-bad">♻ Reset everything</button>
           </div>
           <p className="text-[11px] text-dim leading-relaxed">Backup covers tasks, reminders, notes, layout, and settings (minus the API key). Import also accepts .ics calendars and .md/.txt notes.</p>
@@ -1616,16 +1744,25 @@ function App() {
   const [mode, setMode] = useState(() => LS.get("jarvis.mode", "work"));
   const [order, setOrder] = useState(() => { const saved = LS.get("jarvis.order", null); const ids = ALL_WIDGETS.map((w) => w.id); return saved ? [...saved.filter((id) => ids.includes(id)), ...ids.filter((id) => !saved.includes(id))] : ids; });
   const [sizes, setSizes] = useState(() => LS.get("jarvis.sizes", {}));
-  const [data, setData] = useState(() => ({
-    queue: STUB_PATIENT_QUEUE.map((p) => ({ ...p, seen: false })),
-    familyEvents: STUB_FAMILY_EVENTS, household: STUB_HOUSEHOLD_TASKS,
-    papers: STUB_PAPERS, book: STUB_BOOK, pipeline: STUB_HUSTLE_PIPELINE, revenue: STUB_REVENUE,
-    inbox: STUB_INBOX, admin: STUB_LIFE_ADMIN,
-    dayTasks: LS.get("jarvis.dayTasks", STUB_DAY_TASKS),
-    reminders: LS.get("jarvis.reminders", []),
-    notes: LS.get("jarvis.notes", []),
-    weather: null, vacation: null, draft: null,
-  }));
+  const [data, setData] = useState(() => {
+    const core = LS.get("jarvis.core", {});
+    return {
+      queue: core.queue || STUB_PATIENT_QUEUE.map((p) => ({ ...p, seen: false })),
+      familyEvents: core.familyEvents || STUB_FAMILY_EVENTS, household: core.household || STUB_HOUSEHOLD_TASKS,
+      papers: core.papers || STUB_PAPERS, book: core.book || STUB_BOOK,
+      pipeline: core.pipeline || STUB_HUSTLE_PIPELINE, revenue: core.revenue || STUB_REVENUE,
+      inbox: core.inbox || STUB_INBOX, admin: core.admin || STUB_LIFE_ADMIN,
+      schedule: core.schedule || STUB_CLINIC_SCHEDULE, citations: core.citations || STUB_CITATIONS,
+      dayTasks: LS.get("jarvis.dayTasks", STUB_DAY_TASKS),
+      reminders: LS.get("jarvis.reminders", []),
+      notes: LS.get("jarvis.notes", []),
+      weather: null, vacation: null, draft: null,
+    };
+  });
+  const CORE_KEYS = ["queue", "familyEvents", "household", "papers", "book", "pipeline", "revenue", "inbox", "admin", "schedule", "citations"];
+  useEffect(() => { LS.set("jarvis.core", Object.fromEntries(CORE_KEYS.map((k) => [k, data[k]]))); }, [data]);
+  /* one-line mutator handed to every editable widget */
+  const mut = useCallback((key, fn) => setData((d) => ({ ...d, [key]: fn(d[key]) })), []);
   const [docs, setDocs] = useState(() => LS.get("jarvis.docs", [
     { id: "d-ch4", title: "Ch. 4 — Screening the Village", body: BOOK_DRAFT_TEXT, baseline: BOOK_DRAFT_TEXT, updated: Date.now() },
     { id: "d-ideas", title: "Book ideas & fragments", body: "- Patient voices: quote board for chapter openers\n- Glossary of Setswana health terms\n", baseline: "", updated: Date.now() - 1 },
@@ -1712,8 +1849,7 @@ function App() {
     const set = () => { const vs = speechSynthesis.getVoices(); voiceRef.current = vs.find((v) => /Daniel/i.test(v.name) && v.lang.startsWith("en-GB")) || vs.find((v) => /Google UK English Male/i.test(v.name)) || vs.find((v) => v.lang === "en-GB") || vs.find((v) => v.lang.startsWith("en")) || null; };
     set(); speechSynthesis.onvoiceschanged = set;
   }, []);
-  const speak = useCallback((text) => {
-    setChat((c) => [...c.slice(-30), { who: "jarvis", text }]);
+  const browserSpeak = useCallback((text) => {
     if (!window.speechSynthesis) return;
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
@@ -1724,6 +1860,15 @@ function App() {
     u.onend = () => setOrbState(recRef.current ? "idle" : "off");
     speechSynthesis.speak(u);
   }, [mode, settings.voiceRate, settings.voicePitch]);
+  const speak = useCallback((text) => {
+    setChat((c) => [...c.slice(-30), { who: "jarvis", text }]);
+    if (settings.ttsEngine === "gemini" && geminiTtsKey(settings)) {
+      geminiSpeak(text, settings, { onstart: () => setOrbState("speaking"), onend: () => setOrbState(recRef.current ? "idle" : "off") })
+        .catch(() => browserSpeak(text)); // network/key hiccup → still audible
+      return;
+    }
+    browserSpeak(text);
+  }, [settings, browserSpeak]);
 
   /* reminders + notes + tasks */
   const addReminderRaw = useCallback((text, at) => {
@@ -1760,9 +1905,10 @@ function App() {
 
   /* files import/export (Mac Files bridge) */
   const exportData = useCallback(() => {
-    const payload = { app: "jarvis-os", version: 3, exportedAt: new Date().toISOString(),
+    const payload = { app: "jarvis-os", version: 4, exportedAt: new Date().toISOString(),
+      core: Object.fromEntries(CORE_KEYS.map((k) => [k, data[k]])),
       dayTasks: data.dayTasks, reminders: data.reminders, notes: data.notes, docs, decks, health, order, sizes,
-      settings: { ...settings, aiKey: "" } };
+      settings: { ...settings, aiKey: "", geminiKey: "" } };
     downloadFile("jarvis-backup.json", JSON.stringify(payload, null, 2), "application/json");
     log("PA", "Exported backup .json to Downloads.");
   }, [data, docs, decks, health, order, sizes, settings, log]);
@@ -1779,7 +1925,7 @@ function App() {
         const text = reader.result;
         if (f.name.endsWith(".json")) {
           try { const j = JSON.parse(text);
-            if (j.app === "jarvis-os") { setData((d) => ({ ...d, dayTasks: j.dayTasks || d.dayTasks, reminders: j.reminders || d.reminders, notes: j.notes || d.notes })); if (j.docs) setDocs(j.docs); if (j.decks) setDecks(j.decks); if (j.health) setHealth(j.health); if (j.order) setOrder(j.order); if (j.sizes) setSizes(j.sizes); if (j.settings) setSettings((s) => ({ ...s, ...j.settings, aiKey: s.aiKey })); speak("Backup restored. Welcome back."); }
+            if (j.app === "jarvis-os") { setData((d) => ({ ...d, ...(j.core || {}), dayTasks: j.dayTasks || d.dayTasks, reminders: j.reminders || d.reminders, notes: j.notes || d.notes })); if (j.docs) setDocs(j.docs); if (j.decks) setDecks(j.decks); if (j.health) setHealth(j.health); if (j.order) setOrder(j.order); if (j.sizes) setSizes(j.sizes); if (j.settings) setSettings((s) => ({ ...s, ...j.settings, aiKey: s.aiKey, geminiKey: s.geminiKey })); speak("Backup restored. Welcome back."); }
             else speak("That JSON isn't a Jarvis backup — skipped it.");
           } catch { speak("Couldn't parse that JSON file."); }
         } else if (f.name.endsWith(".ics")) {
@@ -1824,6 +1970,34 @@ function App() {
       ]) + (res.suggestion ? `Closest match I have: "${res.suggestion}". ` : "") + "Tip: add an AI key in Settings ⚙ and I'll handle anything you throw at me.");
     }
   }, [log, speak]);
+
+  /* ✨ per-widget agents — any widget's data goes to the AI Brain with an agent persona */
+  const healthRef = useRef(health); healthRef.current = health;
+  const ASK_SLICES = {
+    queue: (d) => ["Clinic", d.queue], sched: (d) => ["Clinic", d.schedule], risk: (d) => ["Clinic", d.queue.filter((p) => p.risk !== "low")],
+    famcal: (d) => ["Family", d.familyEvents], kids: (d) => ["Family", d.familyEvents.filter((e) => e.cal === "Kids School")],
+    datenight: () => ["Family", { anniversary: ANNIVERSARY, ideas: DATE_NIGHT_IDEAS }], household: (d) => ["Family", d.household],
+    papers: (d) => ["Research", d.papers], book: (d) => ["Research", d.book], cites: (d) => ["Research", d.citations],
+    pipeline: (d) => ["Hustle", d.pipeline], revenue: (d) => ["Hustle", d.revenue], skilllab: () => ["Hustle", SKILL_TRACKS.map((s) => s.skill)],
+    inbox: (d) => ["PA", d.inbox], daysum: (d) => ["PA", d.dayTasks], todo: (d) => ["PA", d.dayTasks], reminders: (d) => ["PA", d.reminders],
+    mission: (d) => ["PA", { tasks: d.dayTasks, patients: d.queue.length, familyEvents: d.familyEvents.length, pipeline: d.pipeline }],
+    calendar: (d) => ["PA", d.familyEvents], health: (d, h) => ["Clinic", h], notes: (d) => ["PA", d.notes], admin: (d) => ["PA", d.admin],
+  };
+  const askAgent = useCallback(async (id) => {
+    const s = ctxRef.current.settings;
+    const w = ALL_WIDGETS.find((x) => x.id === id);
+    if (!s.aiKey) { speak(`Give me an AI key in Settings ⚙ and the ${w.agent} agent will analyse ${w.title} on demand.`); return; }
+    const sl = ASK_SLICES[id];
+    const [agentName, slice] = sl ? sl(ctxRef.current.data, healthRef.current) : ["PA", null];
+    setChat((c) => [...c.slice(-30), { who: "you", text: `✨ ${agentName} agent → analyse ${w.title}` }]);
+    setBusy(true);
+    try {
+      const reply = await llmAsk(`Act as my ${agentName} agent. Analyse my "${w.title}" data and give me your sharpest read in under 70 words plus ONE concrete next action. Data: ${JSON.stringify(slice).slice(0, 4000)}`, ctxRef.current, aiHistRef.current);
+      aiHistRef.current = [...aiHistRef.current, { role: "user", content: `Analyse ${w.title}` }, { role: "assistant", content: reply }].slice(-8);
+      speak(reply);
+    } catch (e) { speak(`The ${agentName} agent hit a snag: ${e.message}.`); }
+    finally { setBusy(false); }
+  }, [speak]);
 
   /* voice input */
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1940,23 +2114,27 @@ function App() {
     slides: <SlidesWidget decks={decks} openStudio={(t) => setModal({ slides: t })} openDeck={(d) => setModal({ slides: "", deck: d })} />,
     reminders: <Reminders reminders={data.reminders} addRaw={addReminderRaw} dismiss={dismissReminder} />,
     daysum: <DaySummary tasks={data.dayTasks} toggle={toggleTask} />,
-    inbox: <UnifiedInbox inbox={data.inbox} onDraft={startDraft} />,
-    queue: <PatientQueue queue={data.queue} markSeen={markSeen} />,
-    sched: <TodaySchedule />,
+    inbox: <UnifiedInbox inbox={data.inbox} onDraft={startDraft} mut={mut} />,
+    queue: <PatientQueue queue={data.queue} markSeen={markSeen} mut={mut} />,
+    sched: <TodaySchedule schedule={data.schedule} mut={mut} />,
     risk: <RiskFlags queue={data.queue} />,
-    famcal: <FamilyCalendar events={data.familyEvents} />,
+    famcal: <FamilyCalendar events={data.familyEvents} mut={mut} />,
     kids: <KidsActivities events={data.familyEvents} />,
     datenight: <DateNightPlanner speak={speak} />,
-    household: <LifeAdmin items={data.household.map((h) => ({ id: h.id, item: h.task, due: h.due, done: h.done }))} toggle={toggleHousehold} />,
-    papers: <ResearchInbox papers={data.papers} toggleRead={toggleRead} />,
-    book: <BookProgress book={data.book} openBook={() => setModal("library")} />,
-    cites: <CitationTracker />,
-    pipeline: <HustlePipeline pipeline={data.pipeline} />,
-    revenue: <RevenueTracker revenue={data.revenue} />,
+    household: <LifeAdmin items={data.household.map((h) => ({ id: h.id, item: h.task, due: h.due, done: h.done }))} toggle={toggleHousehold}
+      onAdd={(item, due) => mut("household", (hs) => [...hs, { id: uid(), task: item, due, done: false }])}
+      onDel={(id) => mut("household", (hs) => hs.filter((h) => h.id !== id))} />,
+    papers: <ResearchInbox papers={data.papers} toggleRead={toggleRead} mut={mut} />,
+    book: <BookProgress book={data.book} openBook={() => setModal("library")} mut={mut} />,
+    cites: <CitationTracker citations={data.citations} mut={mut} />,
+    pipeline: <HustlePipeline pipeline={data.pipeline} mut={mut} />,
+    revenue: <RevenueTracker revenue={data.revenue} mut={mut} />,
     skilllab: <SkillLab speak={speak} />,
     notes: <Notes notes={data.notes} add={addNote} remove={removeNote} />,
     palog: <PALog log={paLog} />,
-    admin: <LifeAdmin items={data.admin} toggle={toggleAdmin} />,
+    admin: <LifeAdmin items={data.admin} toggle={toggleAdmin}
+      onAdd={(item, due) => mut("admin", (as) => [...as, { id: uid(), item, due, done: false }])}
+      onDel={(id) => mut("admin", (as) => as.filter((a) => a.id !== id))} />,
     connectors: <ConnectorsWidget openPanel={(c) => setModal({ connector: c })} />,
   };
 
@@ -1968,6 +2146,7 @@ function App() {
   const renderWidget = (w, forceSize) => (
     <Widget key={w.id} id={w.id} title={w.title} agent={w.agent} size={forceSize || (layout === "focus" ? "sm" : sizes[w.id] || w.defSize)}
       onDragStart={onDragStart} onDragOver={onDragOver} onDrop={onDrop} onResize={onResize}
+      onAsk={["console", "palog", "connectors", "slides"].includes(w.id) ? undefined : askAgent}
       dragging={dragId.current === w.id && dropId !== null} dropTarget={dropId === w.id}>
       {WIDGET_BODY[w.id]}
     </Widget>
@@ -2028,7 +2207,10 @@ function App() {
       {modal === "settings" && <SettingsModal settings={settings} update={setSettings} pinHash={pinHash} setPinHash={setPinHash} onClose={() => setModal(null)}
         notifyStatus={("Notification" in window) ? Notification.permission : "unsupported"}
         requestNotify={() => { if ("Notification" in window) Notification.requestPermission().then(() => setModal(null) || setModal("settings")); }}
-        exportData={exportData} importRef={importRef} resetAll={resetAll} testAI={testAI} aiTestState={aiTestState} />}
+        exportData={exportData} importRef={importRef} resetAll={resetAll}
+        resetDemo={() => { if (confirm("Reset the widget data (patients, events, papers, pipeline…) back to the demo set? Your reminders, notes, docs and settings stay.")) { localStorage.removeItem("jarvis.core"); location.reload(); } }}
+        testAI={testAI} aiTestState={aiTestState}
+        testVoice={() => speak(pick(["This is my natural voice. Rather better, isn't it?", "Testing, testing — how do I sound now, " + settings.name + "?", "Voice check complete. I could read you the phone book and you'd enjoy it."]))} />}
       {modal && modal.connector && <ConnectorModal conn={modal.connector} onClose={() => setModal(null)} importFiles={importFiles} exportData={exportData} exportDaySummary={exportDaySummary} />}
     </div>
   );

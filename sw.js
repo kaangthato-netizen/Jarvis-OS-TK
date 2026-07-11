@@ -1,6 +1,6 @@
 /* Jarvis OS service worker — cache-first shell so the dashboard opens
    instantly (and offline) once installed. Bump VERSION to force refresh. */
-const VERSION = "jarvis-v3";
+const VERSION = "jarvis-v4";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", (e) => {
