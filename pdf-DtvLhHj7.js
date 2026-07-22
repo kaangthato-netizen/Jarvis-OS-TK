@@ -1,0 +1,4 @@
+import{_ as u}from"./index-D3hEZyst.js";import"./vendor-xxE1au3H.js";import"./firebase-DyuBud0P.js";import"./motion-BTm8TqKA.js";let i=null;async function d(){return i||(i=u(()=>import("./pdf-Y4YPUwDk.js"),[]).then(e=>(e.GlobalWorkerOptions.workerSrc=new URL("/assets/pdf.worker.min-DEtVeC4l.mjs",import.meta.url).toString(),e))),i}async function y(e,p=30,s=2e4){const g=await d(),l=e.split(",")[1],r=atob(l),c=new Uint8Array(r.length);for(let t=0;t<r.length;t++)c[t]=r.charCodeAt(t);const n=await g.getDocument({data:c}).promise,a=Math.min(n.numPages,p);let o="";for(let t=1;t<=a;t++){const m=(await(await n.getPage(t)).getTextContent()).items.map(f=>f.str).join(" ").replace(/\s{3,}/g," ").trim();if(m&&(o+=`
+--- Page ${t} ---
+${m}`),o.length>s)break}return n.numPages>a&&(o+=`
+[... ${n.numPages-a} more pages not extracted]`),o.slice(0,s).trim()}export{y as extractPdfText};
